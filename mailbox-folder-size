@@ -1,0 +1,266 @@
+$ScriptName = "mailbox-folder-size"
+
+
+### execution time ###
+$ScriptStartRunTime = (Get-Date)
+
+
+###region general variables ###
+$Date = ( Get-Date ).ToString('dd-MMM-yyyy')
+$DateStamp = ( Get-Date ).ToString('yyyyMMdd-HHmm')
+$SimpleDate = ( Get-Date )
+$ReportFileCSV01 = "C:\Scripts\TEMP\ReportFiles\Mailbox-Size-$DateStamp.csv"
+$ConsoleVerbose = "On" ### comment to turn off
+
+
+### mailbox to check ###
+$UserUPN = "eran@domain.com"
+
+
+### email variables ###
+$ITAdmin1 = "eran"
+$SMTPServer = "EXCHANGE"
+$MsgSubject = "Mailbox Size - $date"
+
+
+### initialize variables ###
+$Count1 = 1
+$Report = @()
+
+
+### get AD DNSRoot for OU normalization ###
+$DomainDNSRoot = (Get-ADDomain | Select DNSRoot).DNSRoot
+$DomainDNSRootReplace = $DomainDNSRoot + "/"
+
+$DomainDN = (Get-ADDomain | Select DistinguishedName).DistinguishedName
+$DomainDNReplace = "," + $DomainDN
+###endregion general variables ###
+
+
+###region admin credentials ###
+$user = "ExchangeAdmin@domain.com"
+$password = Get-Content "C:\Scripts\O365\Admin\O365cred.txt" | ConvertTo-SecureString
+
+
+### connect to MSOnline ###
+Import-Module MSOnline
+$msolcred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $user, $password
+Connect-MsolService -credential $msolcred
+
+
+### connect to O365 - EOL ###
+$cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $user, $password
+$O365EOLSession = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri https://outlook.office365.com/powershell-liveid/ -Credential $cred -Authentication Basic -AllowRedirection
+Import-PSSession $O365EOLSession
+
+
+### Function tests for broken sessions or called on demand and creates a new session ###
+function TestRemotePS ($O365EOLSession, $cred, $do)
+{
+        if ($do -or !$O365EOLSession -or $O365EOLSession.state -ne 'Opened')
+        {
+			Write-Host (Get-Date).ToString('HH:mm') "Removing PSSession $O365EOLSession - $O365EOLSession.state ..." -Foregroundcolor Red -Backgroundcolor Black
+            Remove-PSSession -Session $O365EOLSession
+			
+			Write-Host (Get-Date).ToString('HH:mm') "Creating PSSession $O365EOLSession - $O365EOLSession.state ..." -Foregroundcolor Green -Backgroundcolor Black
+            $O365EOLSession = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri https://outlook.office365.com/powershell-liveid/ -Credential $cred -Authentication Basic -AllowRedirection
+            Import-PSSession $O365EOLSession -AllowClobber | Out-Null
+            
+        }
+        return $O365EOLSession
+}
+###endregion admin credentials ###
+
+
+$O365EOLSession = TestRemotePS $O365EOLSession $cred
+$Query = "Get-Mailbox $UserUPN, $ScriptName, run on $env:computername"
+
+Write-Host (Get-Date).ToString('HH:mm') "Getting list of all user mailboxes ..." -Foregroundcolor Cyan
+$ColUsers = Get-Mailbox $UserUPN
+
+
+Write-Host (Get-Date).ToString('HH:mm') "Getting UserMailbox data ..." -Foregroundcolor Cyan
+ForEach ($ColUser in $ColUsers)
+{
+	$ActivityMessage = $ScriptName  + " - Getting data for:" + $ColUser.Displayname + "-" + $ColUser.UserPrincipalName
+	$StatusMessage = ("Processing {0} of {1}: {2}" -f $Count1, @($ColUsers).count, $ColUser.UserPrincipalName)
+	$PercentComplete = ($Count1 / @($ColUsers).count * 100)
+	Write-Progress -Activity $ActivityMessage -Status $StatusMessage -PercentComplete $PercentComplete
+	
+	
+	### AD Info ###
+	if ($ConsoleVerbose) {Write-Host (Get-Date).ToString('HH:mm') "Getting AD Info for:" $ColUser.Displayname ", UserPrincipalName:" $ColUser.UserPrincipalName -Foregroundcolor Cyan}
+	$UpnPrefix = ($ColUser.UserPrincipalName -split "@")[0].substring(0)
+	$ColUserADInfo = Get-ADUser $UpnPrefix `
+	-properties SamAccountName, Name, CanonicalName, Title, Description, employeeType, LastLogonDate, Created
+	
+	
+	### OU build - CanonicalName ###
+	$OUNormalizedCN = $ColUserADInfo.CanonicalName
+	$OUNormalizedCN = $OUNormalizedCN.Replace($DomainDNSRootReplace, "")
+	$OUNormalizedCN = $OUNormalizedCN.Replace($ColUserADInfo.Name, "")
+	$OUNormalizedCN = $OUNormalizedCN.Replace("/", " - ")
+	
+	
+	###region MailboxStatistics build ###
+	$O365EOLSession = TestRemotePS $O365EOLSession $cred
+	$Stats = Get-MailboxStatistics -id $ColUser.UserPrincipalName | Select-Object ItemCount, TotalItemSize ; Start-Sleep -milliseconds 500
+	
+	$StatsItemSizeString = $Stats.TotalItemSize.ToString()
+	
+	$StatsMailboxSizeMB = "{0:N2}" -f ($StatsItemSizeString.SubString(($StatsItemSizeString.IndexOf("(") + 1),($StatsItemSizeString.IndexOf(" bytes") - ($StatsItemSizeString.IndexOf("(") + 1))).Replace(",","")/1024/1024)
+	$StatsMailboxSizeMB = [math]::Round($StatsMailboxSizeMB)
+	
+	$StatsMailboxSizeGB = "{0:N2}" -f ($StatsItemSizeString.SubString(($StatsItemSizeString.IndexOf("(") + 1),($StatsItemSizeString.IndexOf(" bytes") - ($StatsItemSizeString.IndexOf("(") + 1))).Replace(",","")/1024/1024/1024)
+	$StatsMailboxSizeGB = [math]::Round($StatsMailboxSizeGB)
+	
+	#$StatsMailboxSizeString = ($StatsMailboxSize | Out-String)
+	if ($ConsoleVerbose) {Write-Host (Get-Date).ToString('HH:mm') "MailboxStatistics for" $ColUser.Displayname ", Items:" $Stats.ItemCount "Size:" $StatsMailboxSize "MB -" $Stats.TotalItemSize -Foregroundcolor Yellow}
+	
+	
+	$O365EOLSession = TestRemotePS $O365EOLSession $cred
+	$SendQuota = Get-Mailbox $ColUser.UserPrincipalName | Select-Object ProhibitSendQuota
+	$SendQuotaString = $SendQuota.ProhibitSendQuota.ToString()
+	$SendQuotaStringGB = "{0:N2}" -f ($SendQuotaString.SubString(($SendQuotaString.IndexOf("(") + 1),($SendQuotaString.IndexOf(" bytes") - ($SendQuotaString.IndexOf("(") + 1))).Replace(",","")/1024/1024/1024)
+	###endregion MailboxStatistics build ###
+	
+	
+	### Building report ###	
+	Write-Host (Get-Date).ToString('HH:mm') "Building report for:" $ColUser.Displayname "..." -Foregroundcolor Cyan
+	$ReportObj1 = New-Object PSObject
+	$ColUserPrincipalName = $ColUser.UserPrincipalName
+	$ReportFileCSV02 = "C:\Scripts\TEMP\ReportFiles\Mailbox-Size-$ColUserPrincipalName-$DateStamp.csv"
+
+	
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "Name" -Value $ColUser.Displayname
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "UPN" -Value $ColUserPrincipalName
+	### $ReportObj1 | Add-Member -MemberType NoteProperty -Value $ColUser.ResourceType -Name "Type"
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "OU" -Value $OUNormalizedCN
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "Title" -Value $ColUserADInfo.Title
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "MGMT" -Value $ColUser.CustomAttribute9
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "HR-Type" -Value $ColUserADInfo.employeeType
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "Size-MB" -Value $StatsMailboxSizeMB
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "Size-GB" -Value $StatsMailboxSizeGB
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "ProhibitSendQuota-GB" -Value $SendQuotaStringGB
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "ItemCount" -Value $Stats.ItemCount
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "ArchiveStatus" -Value $ColUser.ArchiveStatus
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "RetentionPolicy" -Value $ColUser.RetentionPolicy
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "Litigation" -Value $ColUser.LitigationHoldEnabled
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "LogonAge-Days" -Value ($SimpleDate - $ColUserADInfo.LastLogonDate).days
+	$ReportObj1 | Add-Member -MemberType NoteProperty -Name "ObjectAge-Days" -Value ($SimpleDate - $ColUserADInfo.Created).days
+	
+	
+	###region MailboxFolderStatistics build ###
+	$O365EOLSession = TestRemotePS $O365EOLSession $cred
+	Write-Host (Get-Date).ToString('HH:mm') "Getting MailboxFolderStatistics data ..." -Foregroundcolor Cyan
+	$ColFolderStatistics = Get-MailboxFolderStatistics -Identity $ColUser.UserPrincipalName | Sort-Object FolderAndSubfolderSize -Descending | Select FolderPath, FolderSize, FolderAndSubfolderSize, ItemsinFolder
+	
+	if ($ConsoleVerbose) {Write-Host (Get-Date).ToString('HH:mm') "ColFolderStatistics count:" ($ColFolderStatistics).count -Foregroundcolor Red -Backgroundcolor Black}
+
+	### initialize variables ###
+	$Count2 = 1
+	$Report2 = @()
+
+	ForEach ($ColFolderStatistic in $ColFolderStatistics)
+	{
+		$ActivityMessage2 = $ScriptName + " - Getting data for:" + $ColFolderStatistic.FolderPath
+		$StatusMessage2 = ("Processing {0} of {1}: {2}" -f $Count2, @($ColFolderStatistics).count, $ColFolderStatistic.FolderPath)
+		$PercentComplete2 = ($Count2 / @($ColFolderStatistics).count * 100)
+		Write-Progress -Activity $ActivityMessage2 -Status $StatusMessage2 -PercentComplete $PercentComplete2
+		
+		
+		$StatsFolderSizeString = $ColFolderStatistic.FolderSize.ToString()
+		$StatsFolderSize = "{0:N2}" -f ($StatsFolderSizeString.SubString(($StatsFolderSizeString.IndexOf("(") + 1),($StatsFolderSizeString.IndexOf(" bytes") - ($StatsFolderSizeString.IndexOf("(") + 1))).Replace(",","")/1024/1024)
+		$StatsFolderSize = [math]::Round($StatsFolderSize)
+		
+		
+		$StatsFolderAndSubfolderSizeString = $ColFolderStatistic.FolderAndSubfolderSize.ToString()
+		$StatsFolderAndSubfolderSize = "{0:N2}" -f ($StatsFolderAndSubfolderSizeString.SubString(($StatsFolderAndSubfolderSizeString.IndexOf("(") + 1),($StatsFolderAndSubfolderSizeString.IndexOf(" bytes") - ($StatsFolderAndSubfolderSizeString.IndexOf("(") + 1))).Replace(",","")/1024/1024)
+		$StatsFolderAndSubfolderSize = [math]::Round($StatsFolderAndSubfolderSize)
+		
+	
+		$ReportObj2 = New-Object PSObject
+		$ReportObj2 | Add-Member -MemberType NoteProperty -Name "FolderPath" -Value $ColFolderStatistic.FolderPath
+		$ReportObj2 | Add-Member -MemberType NoteProperty -Name "FolderAndSubfolderSize-MB" -Value $StatsFolderAndSubfolderSize
+		$ReportObj2 | Add-Member -MemberType NoteProperty -Name "FolderSize-MB" -Value $StatsFolderSize
+		$ReportObj2 | Add-Member -MemberType NoteProperty -Name "ItemsInFolder" -Value $ColFolderStatistic.ItemsinFolder
+		
+		$Report2 += $ReportObj2
+		$Count2++
+	}
+	
+	
+	### export to CSV without type header ###
+	Write-Host (Get-Date).ToString('HH:mm') "Generating CSV ..." -Foregroundcolor Cyan
+	$Report2 | Sort-Object "FolderAndSubfolderSize-MB" -Desc | Export-Csv -NoTypeInformation -Encoding 'UTF8' $ReportFileCSV02
+	###endregion MailboxFolderStatistics build ###
+
+	
+	$Report1 += $ReportObj1
+	
+	$UpnPrefix = $NULL
+	$OUNormalizedCN = $NULL
+	$ColUserADInfo = $NULL
+	$Stats = $NULL
+	$StatsMailboxSize = $NULL
+	$OUNormalizedCN = $NULL
+	
+	$Count1++
+}
+### End of: Getting mailbox data ###
+
+
+### Remove PS Session ###
+Write-Host (Get-Date).ToString('HH:mm') "Removing PSSession: $O365EOLSession" -Foregroundcolor Yellow -Backgroundcolor Black
+Remove-PSSession $O365EOLSession
+
+
+### Report Build ###
+Write-Host (Get-Date).ToString('HH:mm') "Generating Report ..." -Foregroundcolor Cyan
+$SortedReport1 = $Report1 | Sort-Object "Name"
+
+
+### export to CSV without type header ###
+Write-Host (Get-Date).ToString('HH:mm') "Generating CSV ..." -Foregroundcolor Cyan
+$SortedReport1 | Export-Csv -NoTypeInformation -Encoding 'UTF8' $ReportFileCSV01
+
+
+### HTML Build ###
+Write-Host (Get-Date).ToString('HH:mm') "Generating HTML ..." -Foregroundcolor Cyan
+$ReportHTML1 = $SortedReport1 | ConvertTo-Html -Fragment
+
+
+$HTMLHead = "<html>
+		<style>
+		BODY{font-family: Calibri; font-size: 90%;}
+		H1{font-size: 100%; font-family: 'Segoe UI Light','Segoe UI','Lucida Grande',Verdana,Arial,Calibri,Helvetica,sans-serif;}
+		H2{font-size: 90%; font-family: 'Segoe UI Light','Segoe UI','Lucida Grande',Verdana,Arial,Calibri,Helvetica,sans-serif;}
+		H3{font-size: 80%; font-family: 'Segoe UI Light','Segoe UI','Lucida Grande',Verdana,Arial,Calibri,Helvetica,sans-serif;}
+		TABLE{border: 1px solid black; border-collapse: collapse; font-size: 80%;}
+		TH{border: 1px solid #969595; background: #dddddd; padding: 5px; color: #000000;}
+		TD{border: 1px solid #969595; padding: 5px; }
+		</style>
+		<body>
+        <p>Attached detailed mailbox folder size report for $ColUser - $ColUserPrincipalName</p>
+        <p>Mailbox Size: $StatsMailboxSizeGB GB</p>
+        <p>Mailbox Prohibit Send Quota: $SendQuotaStringGB GB</p>"
+		
+
+### execution time ###
+$ScriptEndRunTime = (Get-Date)
+$ScriptTotalRunTime = $(($ScriptEndRunTime-$ScriptStartRunTime).totalminutes)
+$ScriptTotalRunTime =[Math]::Round($ScriptTotalRunTime,1)
+Write-Host (Get-Date).ToString('HH:mm') "Script total running Time: " $ScriptTotalRunTime "minutes" -Foregroundcolor Cyan
+
+
+$HTMLTail01 = "<p style=""font-family: 'Calibri'; font-size: 75%; color:'black'"">Query used: $Query</p>"
+$HTMLTail02 = "<p style=""font-family: 'Calibri'; font-size: 55%; color:'black'"">" + $ScriptTotalRunTime + " m</p></body></html>"
+
+$MSGBodyHTML = $HTMLHead + $ReportHTML1 + $HTMLTail01 + $HTMLTail02
+
+
+### send report in email ###
+Write-Host (Get-Date).ToString('HH:mm') "Sending email to: $ITAdmin1@domain.com" -Foregroundcolor Cyan
+Send-MailMessage -from "Exchange@domain.com" `
+-to "$ITAdmin1@domain.com" -subject $MSGSubject `
+-body $MSGBodyHTML -BodyAsHtml -Attachments $ReportFileCSV01, $ReportFileCSV02 -SMTPServer $SMTPServer
